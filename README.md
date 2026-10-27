@@ -23,7 +23,7 @@ Everything runs inside vLLM: stock vLLM prefills the prompt and the sparse reade
 | `calibration_free_moe/eval/` | Full-vocabulary KL against stock, and the OLMES likelihood suite |
 | `calibration_free_moe/analysis/` | Per-token budget allocation used by the Section 4 analyses |
 | `scripts/` | Command-line entry points: task preparation, evaluation, calibration, recovery maps, speed |
-| `reproduce/` | Reducers that turn stored run files into the paper's tables, figures and counts |
+| `reproduce/` | Reducers that turn evaluation outputs into the paper's tables, figures and counts |
 | `patches/` | Two patches to vLLM 0.29.0 that the sparse runtime needs |
 | `tests/` | Contract tests against independent PyTorch references (most need a CUDA GPU) |
 
@@ -167,8 +167,8 @@ against the faster of stock vLLM's default and tuned fused-MoE configurations;
 
 ## Reproducing the paper's numbers
 
-`reproduce/README.md` maps every number in the main text to the reducer and the stored runs it
-reads. The reducers need no GPU.
+`reproduce/README.md` maps every number in the main text to the evaluation runs that produce its
+inputs and the reducer that turns them into the number. The reducers need no GPU.
 
 ## Tests
 

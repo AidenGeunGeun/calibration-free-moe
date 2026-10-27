@@ -1,4 +1,4 @@
-# Reproducing the paper's numbers from stored runs
+# From evaluation outputs to the paper's numbers
 
 Each module reads the result files the evaluation scripts write (`metrics.json` and
 `scores.json`, or zstd-compressed `.json.zst` twins) and prints the paper's numbers or
@@ -8,7 +8,9 @@ JSON. Run from the repository root with Python 3.12, `numpy` and `zstandard`; `c
 and `allocation_controls` also need torch (CPU is enough), and `context_cut` `safetensors`.
 No module needs vLLM or a GPU.
 
-`RUNS` holds the run directories named below (for example `RUNS/standard-protocols/arms`).
+Run the evaluation commands in the top-level README first; each writes one run directory with
+its `metrics.json` and `scores.json`. `RUNS` is the directory that collects them, under the
+names below (for example `RUNS/standard-protocols/arms`).
 `ALLOC` is the allocation-study root: Qwen3-Thinking at the top level (`deep/`,
 `deep/reference/`, `cut/`, `sweep/`), Gemma 4 and Qwen3.5 under `gem/` and `q35c/` (each with
 `deep/`, `reference/` and `cut/`), and the generation runs in `gen/` and `gen2/`. `DEEP` is
