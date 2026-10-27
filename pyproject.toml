@@ -1,0 +1,46 @@
+[project]
+name = "calibration-free-moe"
+version = "0.1.0"
+description = "Calibration-free channel selection for Mixture-of-Experts decoding in vLLM"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vllm==0.29.0",
+    "torch==2.13.0",
+    "triton==3.7.1",
+    "numpy",
+    "safetensors",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["calibration_free_moe*"]
+
+[project.optional-dependencies]
+# Reducers in reproduce/ that turn stored run files into the paper's numbers.
+reproduce = ["numpy", "zstandard"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "RUF", "RET", "D"]
+# Kernel arguments follow the paper's symbols (H, I, E, K); one-letter names are intended.
+ignore = ["E741", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100", "D101", "D102", "D103", "D104"]
+# Command-line entry points; the module docstring describes the script.
+"scripts/*" = ["D103"]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+pythonPlatform = "Linux"
+typeCheckingMode = "standard"
+include = ["calibration_free_moe", "scripts", "tests", "reproduce"]

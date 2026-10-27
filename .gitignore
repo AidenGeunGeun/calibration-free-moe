@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+overlay/
+.ruff_cache/
+/.worktrees/
+*.egg-info/

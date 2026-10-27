@@ -1,0 +1,468 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -261,7 +261,7 @@
+         assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+         assert hidden_states.dim() == 2
+         assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+-        assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
++        assert w2.stride(-1) == 1 or w2.stride(-2) == 1, "W2 must have a contiguous matrix axis"
+         assert hidden_states.dtype in [
+             torch.float32,
+             torch.float16,
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -797,7 +797,8 @@
+     warn_if_moe_use_td_ineffective("TRITON", is_quantized=is_quantized)
+ 
+     # TD path is unvalidated under quantization; fall back to the pointer path.
+-    use_td = resolve_moe_use_td() and not is_quantized
++    # The descriptor's K-contiguous contract also excludes channel-major W2.
++    use_td = resolve_moe_use_td() and not is_quantized and B.stride(-1) == 1
+     if use_td:
+         # The TD path builds a tensor descriptor inside the kernel, which
+         # requires a PyTorch-backed scratch allocator to be registered
+@@ -1699,7 +1700,7 @@
+     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
+     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
++    assert w2.stride(-1) == 1 or w2.stride(-2) == 1, "W2 must have a contiguous matrix axis"
+     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+ 
+     num_tokens = hidden_states.size(0)
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -186,6 +186,16 @@
+     moe_layer_index: int = 0
+ 
+     additional_kwargs: dict[str, Any] = field(default_factory=dict)
++
++    # Exact decode prefix [0, num_decode_tokens), excluding trailing padding.
++    # None means the producer does not provide a contiguous phase boundary.
++    # Dummy capture batches mark all rows as decode (including padding).
++    num_decode_tokens: int | None = None
++    # (policy rows, stock rows) as row indices when a prefill contains
++    # generated tokens (positions at or beyond the request's prompt length,
++    # e.g. a recompute after preemption): the decode prefix plus those rows,
++    # and every other row including trailing padding. None otherwise.
++    generated_prefill_split: tuple[torch.Tensor, torch.Tensor] | None = None
+ 
+     def __post_init__(self):
+         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
+@@ -220,6 +230,8 @@
+     additional_kwargs: dict[str, Any] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    num_decode_tokens: int | None = None,
++    generated_prefill_split: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ):
+     if vllm_config.compilation_config.fast_moe_cold_start:
+         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
+@@ -238,6 +250,8 @@
+         skip_compiled=skip_compiled,
+         additional_kwargs=additional_kwargs or {},
+         is_padding=is_padding,
++        num_decode_tokens=num_decode_tokens,
++        generated_prefill_split=generated_prefill_split,
+     )
+ 
+ 
+@@ -268,6 +282,8 @@
+     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    num_decode_tokens: int | None = None,
++    generated_prefill_split: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ):
+     """A context manager that stores the current forward context,
+     can be attention metadata, etc.
+@@ -337,6 +353,8 @@
+         additional_kwargs,
+         skip_compiled,
+         is_padding=is_padding,
++        num_decode_tokens=num_decode_tokens,
++        generated_prefill_split=generated_prefill_split,
+     )
+ 
+     try:
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -173,6 +173,14 @@
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
++        self.phase_metadata_enabled: bool = (
++            isinstance(vllm_config.additional_config, dict)
++            and vllm_config.additional_config.get("tokenwise_phase_metadata") is True
++        )
++        if self.phase_metadata_enabled and vllm_config.speculative_config is not None:
++            raise ValueError(
++                "tokenwise_phase_metadata requires no speculative decoding"
++            )
+         self.model_config = vllm_config.model_config
+         self.cache_config = vllm_config.cache_config
+         self.compilation_config = vllm_config.compilation_config
+@@ -643,6 +651,14 @@
+             max_num_reqs=self.max_num_reqs,
+             is_profiling=is_profiling,
+         )
++        if self.phase_metadata_enabled and cudagraph_mode not in (
++            CUDAGraphMode.NONE,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ):
++            raise ValueError(
++                "tokenwise_phase_metadata requires NONE or FULL_DECODE_ONLY graphs; "
++                "mixed/piecewise capture cannot specialize on a CPU phase boundary"
++            )
+         self.cudagraph_manager = ModelCudaGraphManager(
+             self.vllm_config,
+             self.device,
+@@ -758,6 +774,11 @@
+                 skip_attn_for_dummy_run=skip_attn,
+                 is_profile=is_profile,
+                 context_len=context_len,
++                # Compile warmups and memory profiles represent stock prefill.
++                # Only an explicitly requested uniform dummy represents decode.
++                dummy_num_decode_tokens=(
++                    num_tokens if uniform_decode and not is_profile else 0
++                ),
+             )
+         self.kv_connector.set_disabled(False)
+ 
+@@ -1104,10 +1125,15 @@
+             )
+ 
+     def gather_batch_req_state(
+-        self, scheduler_output: SchedulerOutput, dummy_run: bool
++        self,
++        scheduler_output: SchedulerOutput,
++        dummy_run: bool,
++        dummy_num_decode_tokens: int | None = None,
+     ) -> tuple["BatchReqState | None", int | None]:
+         """Gather CPU request state for the scheduled batch, in batch order.
+         Returns (batch_state, uniform_decode_token_count)
++        dummy_num_decode_tokens is synthetic intent (zero or the full token
++        count), never an override for real request state.
+         """
+         num_tokens_per_req = scheduler_output.num_scheduled_tokens
+         num_reqs = len(num_tokens_per_req)
+@@ -1115,6 +1141,10 @@
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+ 
+         if dummy_run:
++            if self.phase_metadata_enabled and dummy_num_decode_tokens == 0:
++                # A synthetic prefill warmup must not replay a decode graph,
++                # even if its request lengths happen to match a decode batch.
++                return None, None
+             # Dummy batches are uniform by construction.
+             return None, get_uniform_decode_token_count(
+                 num_reqs, num_toks, max_query_len, has_prefill=False
+@@ -1137,6 +1167,21 @@
+         ]
+         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+ 
++        num_decode_tokens = None
++        if self.phase_metadata_enabled:
++            # A one-token prefill tail is not decode. Stably partition the
++            # existing batch order by CPU request state, not query length.
++            order = np.concatenate(
++                (np.flatnonzero(~is_prefilling_np), np.flatnonzero(is_prefilling_np))
++            )
++            req_ids = [req_ids[i] for i in order]
++            num_scheduled_tokens = num_scheduled_tokens[order]
++            idx_mapping_np = idx_mapping_np[order]
++            prefill_len_np = prefill_len_np[order]
++            num_computed_prefill_tokens_np = num_computed_prefill_tokens_np[order]
++            is_prefilling_np = is_prefilling_np[order]
++            num_decode_tokens = int(num_scheduled_tokens[~is_prefilling_np].sum())
++
+         if self.adaptive_verification is not None and draft_tokens:
+             num_toks = self.adaptive_verification.get_num_tokens(
+                 num_tokens_per_req, draft_tokens
+@@ -1151,6 +1196,7 @@
+             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+             is_prefilling_np=is_prefilling_np,
+             has_prefill=bool(is_prefilling_np.any()),
++            num_decode_tokens=num_decode_tokens,
+         )
+         return batch_state, get_uniform_decode_token_count(
+             num_reqs, num_toks, max_query_len, batch_state.has_prefill
+@@ -1165,9 +1211,10 @@
+         num_tokens = batch_req_state.num_tokens
+         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+         assert num_tokens > 0
+-        if envs.VLLM_MOE_SKIP_PADDING:
++        if self.phase_metadata_enabled or envs.VLLM_MOE_SKIP_PADDING:
+             # Mark trailing cudagraph-padding rows so kernels can skip work for
+-            # them when supported.
++            # them when supported. Phase-aware readers always consume this mask;
++            # refresh the capture/dummy buffer in place before every real batch.
+             is_padding = self.input_buffers.is_padding
+             is_padding[:num_tokens].fill_(False)
+             is_padding[num_tokens:num_tokens_after_padding].fill_(True)
+@@ -1315,6 +1362,38 @@
+         if self.use_pp:
+             # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
+             max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
++
++        generated_prefill_split = None
++        if self.phase_metadata_enabled and batch_req_state.has_prefill:
++            # Prefill rows at or beyond their request's prompt length are
++            # generated tokens (a preempted request's recompute). Decode-phase
++            # policies own them, so recomputation preserves the function.
++            decode_rows = batch_req_state.num_decode_tokens
++            assert decode_rows is not None
++            prefilling = batch_req_state.is_prefilling_np
++            counts = batch_req_state.num_scheduled_tokens[prefilling]
++            first_generated = (
++                self.req_states.prompt_len.np[idx_mapping_np[prefilling]]
++                - batch_req_state.num_computed_prefill_tokens_np[prefilling]
++            )
++            row_offsets = np.arange(counts.sum()) - np.repeat(
++                np.cumsum(counts) - counts, counts
++            )
++            generated = np.zeros(num_tokens_after_padding - decode_rows, bool)
++            generated[: row_offsets.size] = row_offsets >= np.repeat(
++                first_generated, counts
++            )
++            if generated.any():
++                rows = np.arange(decode_rows, num_tokens_after_padding)
++                generated_prefill_split = (
++                    async_copy_to_gpu(
++                        np.concatenate(
++                            (np.arange(decode_rows), rows[generated])
++                        ),
++                        device=self.device,
++                    ),
++                    async_copy_to_gpu(rows[~generated], device=self.device),
++                )
+ 
+         prompt_lens = None
+         if self.model_config.rswa_window is not None:
+@@ -1344,6 +1423,8 @@
+             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
+             is_prefilling_np=batch_req_state.is_prefilling_np,
+             has_prefill=batch_req_state.has_prefill,
++            num_decode_tokens=batch_req_state.num_decode_tokens,
++            generated_prefill_split=generated_prefill_split,
+             max_seq_len_np=max_seq_len_np,
+             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+             positions=self.input_buffers.positions[:num_tokens_after_padding],
+@@ -1522,6 +1603,7 @@
+         skip_attn_for_dummy_run: bool = False,
+         is_profile: bool = False,
+         context_len: int = 0,
++        dummy_num_decode_tokens: int | None = None,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
+             # Update the request states.
+@@ -1543,7 +1625,7 @@
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+-            scheduler_output, dummy_run
++            scheduler_output, dummy_run, dummy_num_decode_tokens
+         )
+         if batch_req_state is not None:
+             num_toks = batch_req_state.num_tokens
+@@ -1620,6 +1702,8 @@
+                 self.input_buffers,
+                 max_query_len=batch_desc.max_query_len,
+             )
++            if self.phase_metadata_enabled and dummy_num_decode_tokens is not None:
++                input_batch.num_decode_tokens = dummy_num_decode_tokens
+             if not skip_attn_for_dummy_run:
+                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                 if context_len:
+@@ -1761,6 +1845,14 @@
+                 slot_mapping=slot_mappings_by_layer,
+                 skip_compiled=skip_compiled,
+                 is_padding=input_batch.is_padding,
++                # Memory profiling models stock prefill at max batch capacity;
++                # its synthetic rows must not size sparse decode workspaces.
++                num_decode_tokens=(
++                    (0 if is_profile else input_batch.num_decode_tokens)
++                    if self.phase_metadata_enabled
++                    else None
++                ),
++                generated_prefill_split=input_batch.generated_prefill_split,
+             ):
+                 self.kv_connector.pre_forward(scheduler_output)
+                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+@@ -2119,6 +2211,7 @@
+     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
+     is_prefilling_np: np.ndarray  # [num_reqs]
+     has_prefill: bool
++    num_decode_tokens: int | None = None
+ 
+ 
+ def sort_batch_req_ids(
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -112,6 +112,12 @@
+     # stays valid for every replay the graph serves.
+     max_query_len: int | None = None
+ 
++    # Exact contiguous decode prefix, or None when phase ordering is disabled.
++    # Real batches exclude trailing padding; dummy batches include every row.
++    num_decode_tokens: int | None = None
++    # See ForwardContext.generated_prefill_split; None for dummy batches.
++    generated_prefill_split: tuple[torch.Tensor, torch.Tensor] | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+@@ -204,6 +210,7 @@
+             has_structured_output_reqs=False,
+             prompt_lens=None,
+             max_query_len=max_query_len,
++            num_decode_tokens=num_tokens,
+         )
+ 
+ 
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -572,6 +572,17 @@
+                     slot_mapping=slot_mappings,
+                     batch_descriptor=batch_descriptor,
+                     is_padding=input_buffers.is_padding[:num_tokens],
++                    # Capture inputs are synthetic decode even when this closure
++                    # is called with cg_mode=NONE for FULL capture or its warmup.
++                    num_decode_tokens=(
++                        num_tokens
++                        if isinstance(self.vllm_config.additional_config, dict)
++                        and self.vllm_config.additional_config.get(
++                            "tokenwise_phase_metadata"
++                        )
++                        is True
++                        else None
++                    ),
+                 ):
+                     if cg_mode == CUDAGraphMode.PIECEWISE:
+                         # PIECEWISE graph (compiled PW or breakable, chosen inside
+--- a/tests/v1/worker/test_gpu_batch_ordering.py
++++ b/tests/v1/worker/test_gpu_batch_ordering.py
+@@ -17,6 +17,7 @@
+ from typing import Any
+ 
+ import numpy as np
++import pytest
+ import torch
+ 
+ from vllm.v1.attention.backend import CommonAttentionMetadata
+@@ -54,6 +55,7 @@
+     prefill_lens = np.array([s[1] for s in req_states.values()], dtype=np.int32)
+     num_computed = np.array([s[0] for s in req_states.values()], dtype=np.int32)
+     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
++    runner.phase_metadata_enabled = False
+     runner.decode_query_len = decode_query_len
+     runner.adaptive_verification = None
+     runner.req_states = SimpleNamespace(
+@@ -128,18 +130,27 @@
+     assert _uniform_token_count({"p0": (0, 8)}, 8) is None
+ 
+ 
+-def test_dummy_batches_stay_uniform_decode():
+-    # Dummy batches have no request state to consult and must stay classified
+-    # by shape alone; rejecting them would make capture and replay disagree.
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("dummy_num_decode_tokens", [None, 0, 32])
++def test_dummy_batches_respect_synthetic_phase(
++    enabled: bool, dummy_num_decode_tokens: int | None
++):
++    # Explicit synthetic prefill (compile/profile warmup) must not replay a
++    # decode graph even when its shape is identical. Unspecified dummy intent
++    # retains upstream behavior; explicit uniform-decode warmups remain decode.
+     scheduler_output = SimpleNamespace(
+         num_scheduled_tokens={f"_dummy_req_{i}": 8 for i in range(4)},
+         total_num_scheduled_tokens=32,
+     )
+-    state, uniform_tok_count = _make_runner({}).gather_batch_req_state(
+-        scheduler_output, True
++    runner = _make_runner({})
++    runner.phase_metadata_enabled = enabled
++    state, uniform_tok_count = runner.gather_batch_req_state(
++        scheduler_output, True, dummy_num_decode_tokens
+     )
+     assert state is None
+-    assert uniform_tok_count == 8
++    assert uniform_tok_count == (
++        None if enabled and dummy_num_decode_tokens == 0 else 8
++    )
+ 
+ 
+ def test_sort_batch_req_ids_no_spec():
+@@ -183,6 +194,7 @@
+     position would read its row and wrongly reject the two decodes.
+     """
+     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
++    runner.phase_metadata_enabled = False
+     runner.decode_query_len = 8
+     runner.adaptive_verification = None
+     # State arrays in state-index order: a prefilling request, then two decodes.
+@@ -213,6 +225,65 @@
+     assert uniform_tok_count is None
+ 
+ 
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("phase", ["mixed", "prefill", "decode"])
++def test_exact_decode_prefix(enabled: bool, phase: str):
++    # Request-state slots deliberately differ from scheduler/batch order.
++    states = {"chunk": (4, 10), "d2": (8, 8), "tail": (6, 7), "d1": (9, 9)}
++    scheduled = {"tail": 1, "d1": 1, "chunk": 3, "d2": 1}
++    if phase != "mixed":
++        scheduled = {
++            req_id: count
++            for req_id, count in scheduled.items()
++            if req_id.startswith("d") == (phase == "decode")
++        }
++    runner = _make_runner(states, decode_query_len=1)
++    runner.phase_metadata_enabled = enabled
++    scheduler_output = SimpleNamespace(
++        num_scheduled_tokens=scheduled,
++        total_num_scheduled_tokens=sum(scheduled.values()),
++        scheduled_spec_decode_tokens={},
++    )
++    state, uniform_count = runner.gather_batch_req_state(scheduler_output, False)
++    assert state is not None
++    # A synthetic intent argument must never override real request state.
++    state_with_intent, _ = runner.gather_batch_req_state(
++        scheduler_output, False, dummy_num_decode_tokens=0
++    )
++    assert state_with_intent is not None
++    assert state_with_intent.num_decode_tokens == state.num_decode_tokens
++    assert state_with_intent.req_ids == state.req_ids
++    expected = {
++        "mixed": ["d1", "d2", "tail", "chunk"]
++        if enabled
++        else ["tail", "d1", "d2", "chunk"],
++        "prefill": ["tail", "chunk"],
++        "decode": ["d1", "d2"],
++    }[phase]
++    assert state.req_ids == expected
++    assert state.num_decode_tokens == (
++        (0 if phase == "prefill" else 2) if enabled else None
++    )
++    assert state.num_tokens == sum(scheduled.values())
++    assert state.has_prefill == (phase != "decode")
++    assert uniform_count == (1 if phase == "decode" else None)
++    np.testing.assert_array_equal(
++        state.num_scheduled_tokens, [scheduled[r] for r in expected]
++    )
++    np.testing.assert_array_equal(
++        state.idx_mapping_np, [list(states).index(r) for r in expected]
++    )
++    np.testing.assert_array_equal(
++        state.prefill_len_np, [states[r][1] for r in expected]
++    )
++    np.testing.assert_array_equal(
++        state.num_computed_prefill_tokens_np, [states[r][0] for r in expected]
++    )
++    np.testing.assert_array_equal(
++        state.is_prefilling_np, [states[r][0] < states[r][1] for r in expected]
++    )
++
++
+ def test_uniform_decode_predicate():
+     # Shape and prefill state must both pass.
+     assert get_uniform_decode_token_count(2, 16, 8, False) == 8
