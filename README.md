@@ -1,6 +1,7 @@
 # calibration-free-moe
 
-Code for "Channel Selection for Mixture-of-Experts Decoding Needs No Calibration Data".
+Code for "Channel Selection for Mixture-of-Experts Decoding Needs No Calibration Data"
+([arXiv:2610.37386](https://arxiv.org/abs/2610.37386)).
 
 During decoding, each routed expert of a frozen MoE model reads only some of its intermediate
 channels. A small ternary sketch of every expert's gate and up rows stays resident on the GPU and
@@ -180,6 +181,17 @@ Most tests compare the CUDA operator against an independent PyTorch reference an
 rest run on CPU. Run them with the sparse `PYTHONPATH` above. Tests of task preparation and IFEval
 scoring need the second environment's packages and are skipped without them; run those files
 there with `PYTHONPATH=$PWD pytest tests/test_heldout_panels.py tests/test_thinking_requests.py`.
+
+## Citation
+
+```bibtex
+@article{kim2026channel,
+  title   = {Channel Selection for Mixture-of-Experts Decoding Needs No Calibration Data},
+  author  = {Kim, Geunhyoung and Hwang, Sung Ju},
+  journal = {arXiv preprint arXiv:2610.37386},
+  year    = {2026}
+}
+```
 
 ## License
 
